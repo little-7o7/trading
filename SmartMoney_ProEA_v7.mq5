@@ -263,6 +263,31 @@ int OnInit()
    trendEntry = 0; trendHTF = 0;
    lastBullScore = 0; lastBearScore = 0;
    
+   //--- FORCE LOAD M1 HISTORY (critical!)
+   Print("Loading M1 history for ", _Symbol, "...");
+   int m1Need = InpHistoryDays * 1440 + 100;
+   double tempH[];
+   int loaded = CopyHigh(_Symbol, PERIOD_M1, 0, m1Need, tempH);
+   if(loaded < m1Need / 2)
+   {
+      Print("WARNING: Only ", loaded, " M1 bars loaded (need ~", m1Need, ")");
+      Print("TIP: Open M1 chart manually and scroll back 3 days, then restart EA");
+   }
+   else
+   {
+      Print("OK: ", loaded, " M1 bars loaded for analysis");
+   }
+   
+   //--- Also preload HTF
+   double tempH2[];
+   int htfLoaded = CopyHigh(_Symbol, htfTF, 0, 500, tempH2);
+   Print("HTF (", EnumToString(htfTF), "): ", htfLoaded, " bars loaded");
+   
+   //--- Preload entry TF
+   double tempH3[];
+   int entLoaded = CopyHigh(_Symbol, entryTF, 0, 500, tempH3);
+   Print("Entry (", EnumToString(entryTF), "): ", entLoaded, " bars loaded");
+   
    EventSetTimer(1);
    
    Print("╔═══════════════════════════════════════════════╗");
@@ -351,10 +376,19 @@ bool CopyBufs()
 //+------------------------------------------------------------------+
 void CalcHTFTrend()
 {
-   // All 3 EMAs aligned = strong trend
-   bool bull = bHF[0]>bHS[0] && bHF[0]>bH200[0] && bHS[0]>bH200[0];
-   bool bear = bHF[0]<bHS[0] && bHF[0]<bH200[0] && bHS[0]<bH200[0];
-   if(bull) trendHTF=1; else if(bear) trendHTF=-1; else trendHTF=0;
+   // Less strict: 2 of 3 conditions = trend confirmed
+   int bullCount = 0, bearCount = 0;
+   
+   if(bHF[0] > bHS[0])  bullCount++; else bearCount++;
+   if(bHF[0] > bH200[0]) bullCount++; else bearCount++;
+   if(bHS[0] > bH200[0]) bullCount++; else bearCount++;
+   
+   // Also check EMA direction (rising/falling)
+   if(bHF[0] > bHF[1]) bullCount++; else bearCount++;
+   
+   if(bullCount >= 3) trendHTF = 1;
+   else if(bearCount >= 3) trendHTF = -1;
+   else trendHTF = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -398,20 +432,36 @@ void DetectSwings()
    int lb = MathMin(InpOB_Lookback, InpHistoryDays*1440);
    double H[],L[];
    ArraySetAsSeries(H,true); ArraySetAsSeries(L,true);
-   CopyHigh(_Symbol,PERIOD_M1,0,lb,H);
-   CopyLow(_Symbol,PERIOD_M1,0,lb,L);
    
-   for(int i=5;i<lb-5;i++)
+   // Try M1 first
+   int loaded = CopyHigh(_Symbol,PERIOD_M1,0,lb,H);
+   int loadedL = CopyLow(_Symbol,PERIOD_M1,0,lb,L);
+   
+   // Fallback: if M1 has less than 100 bars, use entry TF
+   ENUM_TIMEFRAMES useTF = PERIOD_M1;
+   if(loaded < 100)
+   {
+      lb = 500; // use more bars on higher TF
+      loaded = CopyHigh(_Symbol,entryTF,0,lb,H);
+      loadedL = CopyLow(_Symbol,entryTF,0,lb,L);
+      useTF = entryTF;
+   }
+   
+   if(loaded < 20 || loadedL < 20) return; // not enough data
+   int maxI = MathMin(loaded, lb) - 5;
+   
+   for(int i=5;i<maxI-1;i++)
    {
       bool isH=true, isL=true;
       for(int j=1;j<=5;j++)
       {
+         if(i-j<0 || i+j>=loaded) { isH=false; isL=false; break; }
          if(H[i]<=H[i-j]||H[i]<=H[i+j]) isH=false;
          if(L[i]>=L[i-j]||L[i]>=L[i+j]) isL=false;
       }
-      if(isH){ SSW s;s.p=H[i];s.t=iTime(_Symbol,PERIOD_M1,i);s.d=1;s.b=i;
+      if(isH){ SSW s;s.p=H[i];s.t=iTime(_Symbol,useTF,i);s.d=1;s.b=i;
                int n=ArraySize(SWs);ArrayResize(SWs,n+1);SWs[n]=s; }
-      if(isL){ SSW s;s.p=L[i];s.t=iTime(_Symbol,PERIOD_M1,i);s.d=-1;s.b=i;
+      if(isL){ SSW s;s.p=L[i];s.t=iTime(_Symbol,useTF,i);s.d=-1;s.b=i;
                int n=ArraySize(SWs);ArrayResize(SWs,n+1);SWs[n]=s; }
    }
 }
@@ -426,13 +476,28 @@ void DetectOBs()
    double O[],H[],L[],C[]; long V[];
    ArraySetAsSeries(O,true);ArraySetAsSeries(H,true);ArraySetAsSeries(L,true);
    ArraySetAsSeries(C,true);ArraySetAsSeries(V,true);
-   CopyOpen(_Symbol,PERIOD_M1,0,lb,O);CopyHigh(_Symbol,PERIOD_M1,0,lb,H);
-   CopyLow(_Symbol,PERIOD_M1,0,lb,L);CopyClose(_Symbol,PERIOD_M1,0,lb,C);
-   CopyTickVolume(_Symbol,PERIOD_M1,0,lb,V);
    
-   double av=0; for(int i=1;i<=100&&i<lb;i++) av+=(double)V[i]; av/=100; if(av<=0)av=1;
+   // Try M1, fallback to entry TF
+   ENUM_TIMEFRAMES useTF = PERIOD_M1;
+   int loaded = CopyOpen(_Symbol,PERIOD_M1,0,lb,O);
+   if(loaded < 100)
+   {
+      useTF = entryTF;
+      lb = 500;
+      loaded = CopyOpen(_Symbol,useTF,0,lb,O);
+   }
    
-   for(int i=2;i<lb-2;i++)
+   CopyHigh(_Symbol,useTF,0,lb,H);
+   CopyLow(_Symbol,useTF,0,lb,L);
+   CopyClose(_Symbol,useTF,0,lb,C);
+   CopyTickVolume(_Symbol,useTF,0,lb,V);
+   
+   if(loaded < 20) return;
+   int maxI = MathMin(loaded, lb);
+   
+   double av=0; for(int i=1;i<=100&&i<maxI;i++) av+=(double)V[i]; av/=MathMin(100,maxI-1); if(av<=0)av=1;
+   
+   for(int i=2;i<maxI-2;i++)
    {
       double bI=MathAbs(C[i]-O[i]),bP=MathAbs(C[i-1]-O[i-1]);
       // Bullish OB
@@ -467,10 +532,21 @@ void DetectFVGs()
    ArrayResize(FVGs,0);
    int lb=MathMin(InpOB_Lookback,InpHistoryDays*1440);
    double H[],L[];ArraySetAsSeries(H,true);ArraySetAsSeries(L,true);
-   CopyHigh(_Symbol,PERIOD_M1,0,lb,H);CopyLow(_Symbol,PERIOD_M1,0,lb,L);
+   
+   ENUM_TIMEFRAMES useTF = PERIOD_M1;
+   int loaded = CopyHigh(_Symbol,PERIOD_M1,0,lb,H);
+   if(loaded < 100)
+   {
+      useTF = entryTF; lb = 500;
+      loaded = CopyHigh(_Symbol,useTF,0,lb,H);
+   }
+   CopyLow(_Symbol,useTF,0,lb,L);
+   if(loaded < 20) return;
+   int maxI = MathMin(loaded, lb);
+   
    double pt=si.Point(),mg=InpFVG_MinGap*pt;
    
-   for(int i=2;i<lb-1;i++)
+   for(int i=2;i<maxI-1;i++)
    {
       double bt=L[i-1],bb=H[i+1];
       if(bb<bt&&(bt-bb)>=mg)
