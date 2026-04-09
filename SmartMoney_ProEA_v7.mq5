@@ -76,7 +76,7 @@ input int            InpW_MACD      = 3;     // Weight: MACD Confirm
 input int            InpW_Stoch     = 3;     // Weight: Stochastic Confirm
 input int            InpW_Engulf    = 6;     // Weight: Engulfing/PinBar
 input int            InpW_Volume    = 3;     // Weight: Volume Confirm
-input int            InpMinScore    = 25;    // Minimum Score to Enter
+input int            InpMinScore    = 22;    // Minimum Score to Enter
 
 input group "═══════ SMART PROFIT PROTECTION ═══════"
 input bool           InpUseBE       = true;
@@ -698,6 +698,22 @@ int ScoreAndDecide()
    sc_SNR=0;sc_Liq=0;sc_EMA=0;sc_RSI=0;sc_MACD=0;
    sc_Stoch=0;sc_Engulf=0;sc_Vol=0;
    
+   //=== CHECK LAST 3 CANDLES DIRECTION (prevent entering against momentum) ===
+   double entC[],entO[];
+   ArraySetAsSeries(entC,true); ArraySetAsSeries(entO,true);
+   CopyClose(_Symbol,entryTF,0,5,entC);
+   CopyOpen(_Symbol,entryTF,0,5,entO);
+   
+   int recentDir = 0;
+   int bullCandles = 0, bearCandles = 0;
+   for(int c=1; c<=3; c++)
+   {
+      if(entC[c] > entO[c]) bullCandles++;
+      else if(entC[c] < entO[c]) bearCandles++;
+   }
+   if(bullCandles >= 2) recentDir = 1;
+   if(bearCandles >= 2) recentDir = -1;
+   
    //=== 1. HTF TREND (highest weight) ===
    if(trendHTF==1)  { bullScore += InpW_Trend; sc_Trend = InpW_Trend; }
    if(trendHTF==-1) { bearScore += InpW_Trend; sc_Trend = -InpW_Trend; }
@@ -804,19 +820,34 @@ int ScoreAndDecide()
    //=== DECISION ===
    int dir = 0;
    
-   // Score decides direction. HTF trend adds weight but does NOT block.
-   // If bearScore > bullScore and meets minimum, SELL is allowed even if HTF is flat.
    if(bullScore >= InpMinScore && bullScore > bearScore)
       dir = 1;
    else if(bearScore >= InpMinScore && bearScore > bullScore)
       dir = -1;
    
-   // Extra safety: if BOTH scores are above minimum, pick the stronger one
    if(bullScore >= InpMinScore && bearScore >= InpMinScore)
    {
       if(bullScore > bearScore) dir = 1;
       else if(bearScore > bullScore) dir = -1;
-      else dir = 0; // equal = no trade
+      else dir = 0;
+   }
+   
+   //=== CANDLE DIRECTION FILTER: don't enter against recent 3-candle momentum ===
+   if(dir == 1 && recentDir == -1) dir = 0; // Don't BUY into bearish momentum
+   if(dir == -1 && recentDir == 1) dir = 0; // Don't SELL into bullish momentum
+   
+   //=== COOLDOWN: don't open new trade within 2 bars of last trade ===
+   if(dir != 0)
+   {
+      datetime lastTT = (datetime)GlobalVariableGet("SM7_lastTrade");
+      if(lastTT > 0)
+      {
+         int barsSince = iBarShift(_Symbol, entryTF, lastTT);
+         if(barsSince < 2)
+         {
+            dir = 0; // Wait at least 2 bars between trades
+         }
+      }
    }
    
    if(dir != 0)
@@ -896,7 +927,11 @@ void OpenTrade(int dir)
       sl=NormalizeDouble(sl,si.Digits());
       if(tp>0) tp=NormalizeDouble(tp,si.Digits());
       if(tr.Buy(lot,_Symbol,ask,sl,tp,"SM7_BUY"))
+      {
         Print("✓ BUY ",lot," SL:",sl," TP:",(tp>0?DoubleToString(tp,si.Digits()):"NONE")," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
+        // Record trade time for cooldown
+        GlobalVariableSet("SM7_lastTrade", (double)TimeCurrent());
+      }
    }
    else
    {
@@ -948,7 +983,10 @@ void OpenTrade(int dir)
       sl=NormalizeDouble(sl,si.Digits());
       if(tp>0) tp=NormalizeDouble(tp,si.Digits());
       if(tr.Sell(lot,_Symbol,bid,sl,tp,"SM7_SELL"))
+      {
         Print("✓ SELL ",lot," SL:",sl," TP:",(tp>0?DoubleToString(tp,si.Digits()):"NONE")," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
+        GlobalVariableSet("SM7_lastTrade", (double)TimeCurrent());
+      }
    }
 }
 
@@ -1027,7 +1065,16 @@ void ManagePositions()
       // === Calculate $ per point (works for ALL instruments including GOLD) ===
       // Use OrderCalcProfit to get accurate value
       double ppp = 0;
-      double testDist = 100 * si.Point(); // test with 100 points
+      //=== EMERGENCY: hard $ loss limit — ALWAYS runs, no exceptions ===
+      if(InpMaxSL_USD > 0 && prof <= -InpMaxSL_USD)
+      {
+         tr.PositionClose(tk);
+         Print("✗ EMERGENCY CLOSE #", tk, " Loss:$", DoubleToString(prof,2));
+         continue;
+      }
+      
+      // === Calculate $ per point ===
+      double testDist = 100 * si.Point();
       double testProfit = 0;
       
       if(pi.PositionType() == POSITION_TYPE_BUY)
@@ -1041,7 +1088,6 @@ void ManagePositions()
             ppp = MathAbs(testProfit / testDist);
       }
       
-      // Fallback
       if(ppp <= 0)
       {
          double tv = si.TickValue();
@@ -1050,14 +1096,6 @@ void ManagePositions()
       }
       
       if(ppp <= 0) continue;
-      
-      //=== EMERGENCY: hard $2 loss limit ===
-      if(InpMaxSL_USD > 0 && prof <= -InpMaxSL_USD)
-      {
-         tr.PositionClose(tk);
-         Print("✗ EMERGENCY #", tk, " Loss:$", DoubleToString(prof,2));
-         continue;
-      }
       
       //=== Track max profit ===
       double prevMax = GetMaxProfit(tk);
