@@ -853,7 +853,8 @@ void OpenTrade(int dir)
                {
                   double midSL = (hiSL + loSL) / 2.0;
                   double midLoss = 0;
-                  OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, lot, ask, midSL, midLoss);
+                  if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, lot, ask, midSL, midLoss))
+                     midLoss = 0;
                   if(MathAbs(midLoss) > InpMaxSL_USD)
                      loSL = midSL; // SL too far, move closer
                   else
@@ -899,7 +900,8 @@ void OpenTrade(int dir)
                {
                   double midSL = (hiSL + loSL) / 2.0;
                   double midLoss = 0;
-                  OrderCalcProfit(ORDER_TYPE_SELL, _Symbol, lot, bid, midSL, midLoss);
+                  if(!OrderCalcProfit(ORDER_TYPE_SELL, _Symbol, lot, bid, midSL, midLoss))
+                     midLoss = 0;
                   if(MathAbs(midLoss) > InpMaxSL_USD)
                      hiSL = midSL;
                   else
