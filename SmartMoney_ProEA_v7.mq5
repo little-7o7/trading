@@ -77,14 +77,15 @@ input int            InpW_Engulf    = 6;     // Weight: Engulfing/PinBar
 input int            InpW_Volume    = 3;     // Weight: Volume Confirm
 input int            InpMinScore    = 25;    // Minimum Score to Enter
 
-input group "═══════ BREAKEVEN ($-based for small accounts) ═══════"
+input group "═══════ SMART PROFIT PROTECTION ═══════"
 input bool           InpUseBE       = true;
-input double         InpBE1_AtUSD   = 1.50;  // Layer 1: at +$1.50 profit
-input double         InpBE1_LockUSD = 0.30;  // Layer 1: lock +$0.30
-input double         InpBE2_AtUSD   = 3.00;  // Layer 2: at +$3.00
-input double         InpBE2_LockUSD = 1.50;  // Layer 2: lock +$1.50
-input double         InpBE3_AtUSD   = 5.00;  // Layer 3: at +$5.00
-input double         InpBE3_LockUSD = 3.00;  // Layer 3: lock +$3.00
+input double         InpBE_StartUSD = 1.00;  // Start protecting at +$1
+input double         InpBE_FirstLock= 0.20;  // First lock: +$0.20
+input double         InpTrailPct    = 60.0;  // Protect % of max profit
+// Example: profit=$10 → SL locks $6 (60%)
+// Example: profit=$20 → SL locks $12 (60%)
+// Example: profit=$50 → SL locks $30 (60%)
+// SL ALWAYS moves UP, never down!
 
 input group "═══════ TRAILING STOP ═══════"
 input bool           InpTrail       = true;   // Enable trailing
@@ -174,6 +175,11 @@ int trendEntry, trendHTF;
 double asianHi, asianLo;
 string PFX;
 
+// Per-position max profit tracking (up to 10 positions)
+ulong  maxProfTickets[10];
+double maxProfValues[10];
+int    maxProfCount;
+
 // Score breakdown (for display)
 int sc_Trend,sc_Struct,sc_OB,sc_FVG,sc_Fib,sc_SNR,sc_Liq;
 int sc_EMA,sc_RSI,sc_MACD,sc_Stoch,sc_Engulf,sc_Vol;
@@ -261,6 +267,9 @@ int OnInit()
    initBal = ai.Balance(); peakBal = initBal; lastBar = 0;
    trendEntry = 0; trendHTF = 0;
    lastBullScore = 0; lastBearScore = 0;
+   maxProfCount = 0;
+   ArrayInitialize(maxProfValues, 0);
+   ArrayInitialize(maxProfTickets, 0);
    
    //--- FORCE LOAD M1 HISTORY (critical!)
    Print("Loading M1 history for ", _Symbol, "...");
@@ -910,7 +919,44 @@ double CalcLot(double slD)
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE — 3-layer BE + trail + time close                         |
+//| Helper: get/set max profit for a ticket                          |
+//+------------------------------------------------------------------+
+double GetMaxProfit(ulong ticket)
+{
+   for(int i=0; i<maxProfCount; i++)
+      if(maxProfTickets[i]==ticket) return maxProfValues[i];
+   return 0;
+}
+
+void SetMaxProfit(ulong ticket, double val)
+{
+   for(int i=0; i<maxProfCount; i++)
+   {
+      if(maxProfTickets[i]==ticket)
+      {
+         if(val > maxProfValues[i]) maxProfValues[i] = val;
+         return;
+      }
+   }
+   if(maxProfCount < 10)
+   {
+      maxProfTickets[maxProfCount] = ticket;
+      maxProfValues[maxProfCount] = val;
+      maxProfCount++;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE — Smart % Trailing + Emergency SL                          |
+//|                                                                   |
+//| Logic:                                                            |
+//|   profit < $1    → normal SL (no change)                         |
+//|   profit >= $1   → SL moves to breakeven +$0.20                  |
+//|   profit >= $2   → SL protects 60% of MAX profit                 |
+//|   profit $10     → SL at +$6                                     |
+//|   profit $20     → SL at +$12                                    |
+//|   profit $50     → SL at +$30                                    |
+//|   SL NEVER moves backwards!                                      |
 //+------------------------------------------------------------------+
 void ManagePositions()
 {
@@ -921,141 +967,87 @@ void ManagePositions()
       if(!pi.SelectByIndex(i)) continue;
       if(pi.Magic() != InpMagic || pi.Symbol() != _Symbol) continue;
       
-      double op    = pi.PriceOpen();
-      double cSL   = pi.StopLoss();
-      double cTP   = pi.TakeProfit();
-      double prof  = pi.Profit();
-      double vol   = pi.Volume();
-      datetime ot  = pi.Time();
-      ulong  tk    = pi.Ticket();
+      double op   = pi.PriceOpen();
+      double cSL  = pi.StopLoss();
+      double cTP  = pi.TakeProfit();
+      double prof = pi.Profit();
+      double vol  = pi.Volume();
+      datetime ot = pi.Time();
+      ulong  tk   = pi.Ticket();
       
-      //--- Convert $ to price distance
-      //    profitPerPoint = volume * tickValue / tickSize
+      // $ per point for this position
       double tv = si.TickValue();
       double ts = si.TickSize();
-      double profPerPt = (tv > 0 && ts > 0) ? (vol * tv / ts) : 0;
+      double ppp = (tv > 0 && ts > 0) ? (vol * tv / ts) : 0;
+      if(ppp <= 0) continue;
       
-      //--- EMERGENCY: close if loss exceeds $MaxSL
+      //=== EMERGENCY: hard $2 loss limit ===
       if(InpMaxSL_USD > 0 && prof <= -InpMaxSL_USD)
       {
          tr.PositionClose(tk);
-         Print("✗ EMERGENCY CLOSE #", tk, " Loss: $", DoubleToString(prof,2),
-               " exceeded max $", DoubleToString(InpMaxSL_USD,2));
+         Print("✗ EMERGENCY #", tk, " Loss:$", DoubleToString(prof,2));
          continue;
       }
       
+      //=== Track max profit ===
+      double prevMax = GetMaxProfit(tk);
+      if(prof > prevMax) SetMaxProfit(tk, prof);
+      double maxProf = GetMaxProfit(tk);
+      
+      //=== Calculate target SL in $ ===
+      double targetLockUSD = 0;
+      
+      if(maxProf >= InpBE_StartUSD && maxProf < InpBE_StartUSD * 2)
+      {
+         // Phase 1: just breakeven + small lock
+         targetLockUSD = InpBE_FirstLock;
+      }
+      else if(maxProf >= InpBE_StartUSD * 2)
+      {
+         // Phase 2: protect % of max profit (scales infinitely)
+         targetLockUSD = maxProf * InpTrailPct / 100.0;
+      }
+      
+      if(targetLockUSD <= 0) continue; // not yet in profit zone
+      
+      //=== Convert $ lock to price and move SL ===
+      double lockDist = targetLockUSD / ppp;
+      
       if(pi.PositionType() == POSITION_TYPE_BUY)
       {
-         double bid = si.Bid();
+         double newSL = NormalizeDouble(op + lockDist, si.Digits());
          
-         //=== $-BASED BREAKEVEN ===
-         if(InpUseBE && profPerPt > 0)
+         // SL NEVER moves down
+         if(newSL > cSL)
          {
-            // Layer 1
-            if(prof >= InpBE1_AtUSD && cSL < op)
-            {
-               double lockDist = InpBE1_LockUSD / profPerPt;
-               double ns = NormalizeDouble(op + lockDist, si.Digits());
-               if(ns > cSL)
-               {
-                  tr.PositionModify(tk, ns, cTP);
-                  Print("→ BE1: SL→+$", DoubleToString(InpBE1_LockUSD,2), " #", tk,
-                        " Profit:$", DoubleToString(prof,2));
-               }
-            }
-            // Layer 2
-            if(prof >= InpBE2_AtUSD)
-            {
-               double lockDist = InpBE2_LockUSD / profPerPt;
-               double ns = NormalizeDouble(op + lockDist, si.Digits());
-               if(ns > cSL)
-                  tr.PositionModify(tk, ns, cTP);
-            }
-            // Layer 3
-            if(prof >= InpBE3_AtUSD)
-            {
-               double lockDist = InpBE3_LockUSD / profPerPt;
-               double ns = NormalizeDouble(op + lockDist, si.Digits());
-               if(ns > cSL)
-                  tr.PositionModify(tk, ns, cTP);
-            }
-         }
-         
-         //=== TRAILING (also $-based) ===
-         if(InpTrail && prof >= InpBE2_AtUSD)
-         {
-            double trailDist = InpBE1_AtUSD / profPerPt; // trail by $1.50
-            double ns = NormalizeDouble(bid - trailDist, si.Digits());
-            if(ns > cSL + pt && ns > op)
-               tr.PositionModify(tk, ns, cTP);
-         }
-         
-         //=== TIME CLOSE ===
-         if(InpTimeClose && prof >= InpTC_MinProf)
-         {
-            int el = (int)(TimeCurrent() - ot) / 60;
-            if(el >= InpTC_Min)
-            {
-               tr.PositionClose(tk);
-               Print("⏱ Time close #", tk, " +$", DoubleToString(prof,2));
-            }
+            if(tr.PositionModify(tk, newSL, cTP))
+               Print("↑ SL→+$", DoubleToString(targetLockUSD,2),
+                     " (max:$", DoubleToString(maxProf,2),
+                     " now:$", DoubleToString(prof,2), ") #", tk);
          }
       }
       else // SELL
       {
-         double ask = si.Ask();
+         double newSL = NormalizeDouble(op - lockDist, si.Digits());
          
-         //=== $-BASED BREAKEVEN ===
-         if(InpUseBE && profPerPt > 0)
+         // SL NEVER moves up (for sells, lower = better)
+         if(newSL < cSL || cSL == 0)
          {
-            // Layer 1
-            if(prof >= InpBE1_AtUSD && (cSL > op || cSL == 0))
-            {
-               double lockDist = InpBE1_LockUSD / profPerPt;
-               double ns = NormalizeDouble(op - lockDist, si.Digits());
-               if(ns < cSL || cSL == 0)
-               {
-                  tr.PositionModify(tk, ns, cTP);
-                  Print("→ BE1: SL→+$", DoubleToString(InpBE1_LockUSD,2), " #", tk,
-                        " Profit:$", DoubleToString(prof,2));
-               }
-            }
-            // Layer 2
-            if(prof >= InpBE2_AtUSD)
-            {
-               double lockDist = InpBE2_LockUSD / profPerPt;
-               double ns = NormalizeDouble(op - lockDist, si.Digits());
-               if(ns < cSL || cSL == 0)
-                  tr.PositionModify(tk, ns, cTP);
-            }
-            // Layer 3
-            if(prof >= InpBE3_AtUSD)
-            {
-               double lockDist = InpBE3_LockUSD / profPerPt;
-               double ns = NormalizeDouble(op - lockDist, si.Digits());
-               if(ns < cSL || cSL == 0)
-                  tr.PositionModify(tk, ns, cTP);
-            }
+            if(tr.PositionModify(tk, newSL, cTP))
+               Print("↓ SL→+$", DoubleToString(targetLockUSD,2),
+                     " (max:$", DoubleToString(maxProf,2),
+                     " now:$", DoubleToString(prof,2), ") #", tk);
          }
-         
-         //=== TRAILING ===
-         if(InpTrail && prof >= InpBE2_AtUSD)
+      }
+      
+      //=== TIME CLOSE ===
+      if(InpTimeClose && prof >= InpTC_MinProf)
+      {
+         int el = (int)(TimeCurrent() - ot) / 60;
+         if(el >= InpTC_Min)
          {
-            double trailDist = InpBE1_AtUSD / profPerPt;
-            double ns = NormalizeDouble(ask + trailDist, si.Digits());
-            if((ns < cSL - pt || cSL == 0) && ns < op)
-               tr.PositionModify(tk, ns, cTP);
-         }
-         
-         //=== TIME CLOSE ===
-         if(InpTimeClose && prof >= InpTC_MinProf)
-         {
-            int el = (int)(TimeCurrent() - ot) / 60;
-            if(el >= InpTC_Min)
-            {
-               tr.PositionClose(tk);
-               Print("⏱ Time close #", tk, " +$", DoubleToString(prof,2));
-            }
+            tr.PositionClose(tk);
+            Print("⏱ Close #", tk, " +$", DoubleToString(prof,2));
          }
       }
    }
