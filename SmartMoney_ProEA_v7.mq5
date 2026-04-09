@@ -839,19 +839,29 @@ void OpenTrade(int dir)
       // Calculate lot first, then cap SL to $MaxSL
       double lot=CalcLot(asl);
       
-      // Cap SL to max $ loss
+      // Cap SL to max $ loss using OrderCalcProfit (accurate for ALL instruments)
       if(InpMaxSL_USD > 0 && lot > 0)
       {
-         double tv=si.TickValue(), ts=si.TickSize();
-         if(tv>0 && ts>0)
+         double lossAtSL = 0;
+         if(OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, lot, ask, sl, lossAtSL))
          {
-            double profPerPt = lot * tv / ts;
-            double maxDist = InpMaxSL_USD / profPerPt;
-            if(asl > maxDist)
+            if(MathAbs(lossAtSL) > InpMaxSL_USD)
             {
-               asl = maxDist;
-               sl = NormalizeDouble(bid - asl, si.Digits());
-               Print("SL capped to $", DoubleToString(InpMaxSL_USD,2), " dist:", DoubleToString(asl/pt,0), "pts");
+               // Binary search for correct SL distance
+               double hiSL = bid, loSL = sl;
+               for(int iter=0; iter<20; iter++)
+               {
+                  double midSL = (hiSL + loSL) / 2.0;
+                  double midLoss = 0;
+                  OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, lot, ask, midSL, midLoss);
+                  if(MathAbs(midLoss) > InpMaxSL_USD)
+                     loSL = midSL; // SL too far, move closer
+                  else
+                     hiSL = midSL; // can go further
+               }
+               sl = NormalizeDouble(loSL, si.Digits());
+               asl = bid - sl;
+               Print("SL capped to ~$", DoubleToString(InpMaxSL_USD,2));
             }
          }
       }
@@ -879,16 +889,25 @@ void OpenTrade(int dir)
       // Cap SL to max $ loss
       if(InpMaxSL_USD > 0 && lot > 0)
       {
-         double tv=si.TickValue(), ts=si.TickSize();
-         if(tv>0 && ts>0)
+         double lossAtSL = 0;
+         if(OrderCalcProfit(ORDER_TYPE_SELL, _Symbol, lot, bid, sl, lossAtSL))
          {
-            double profPerPt = lot * tv / ts;
-            double maxDist = InpMaxSL_USD / profPerPt;
-            if(asl > maxDist)
+            if(MathAbs(lossAtSL) > InpMaxSL_USD)
             {
-               asl = maxDist;
-               sl = NormalizeDouble(ask + asl, si.Digits());
-               Print("SL capped to $", DoubleToString(InpMaxSL_USD,2), " dist:", DoubleToString(asl/pt,0), "pts");
+               double hiSL = sl, loSL = ask;
+               for(int iter=0; iter<20; iter++)
+               {
+                  double midSL = (hiSL + loSL) / 2.0;
+                  double midLoss = 0;
+                  OrderCalcProfit(ORDER_TYPE_SELL, _Symbol, lot, bid, midSL, midLoss);
+                  if(MathAbs(midLoss) > InpMaxSL_USD)
+                     hiSL = midSL;
+                  else
+                     loSL = midSL;
+               }
+               sl = NormalizeDouble(hiSL, si.Digits());
+               asl = sl - ask;
+               Print("SL capped to ~$", DoubleToString(InpMaxSL_USD,2));
             }
          }
       }
@@ -976,9 +995,29 @@ void ManagePositions()
       ulong  tk   = pi.Ticket();
       
       // $ per point for this position
-      double tv = si.TickValue();
-      double ts = si.TickSize();
-      double ppp = (tv > 0 && ts > 0) ? (vol * tv / ts) : 0;
+      // Method: derive from actual profit and price distance (works on ALL instruments)
+      double ppp = 0;
+      double priceDist = 0;
+      
+      if(pi.PositionType() == POSITION_TYPE_BUY)
+         priceDist = si.Bid() - op;
+      else
+         priceDist = op - si.Ask();
+      
+      // If we have actual profit and price moved, calculate real $/point
+      if(MathAbs(priceDist) > pt && MathAbs(prof) > 0.001)
+      {
+         ppp = MathAbs(prof / priceDist);
+      }
+      else
+      {
+         // Fallback: use tick value formula
+         double tv = si.TickValue();
+         double ts = si.TickSize();
+         if(tv > 0 && ts > 0)
+            ppp = vol * tv / ts;
+      }
+      
       if(ppp <= 0) continue;
       
       //=== EMERGENCY: hard $2 loss limit ===
@@ -1020,10 +1059,15 @@ void ManagePositions()
          // SL NEVER moves down
          if(newSL > cSL)
          {
-            if(tr.PositionModify(tk, newSL, cTP))
+            bool ok = tr.PositionModify(tk, newSL, cTP);
+            if(ok)
                Print("↑ SL→+$", DoubleToString(targetLockUSD,2),
                      " (max:$", DoubleToString(maxProf,2),
-                     " now:$", DoubleToString(prof,2), ") #", tk);
+                     " now:$", DoubleToString(prof,2),
+                     " ppp:", DoubleToString(ppp,4), ") #", tk);
+            else
+               Print("⚠ SL modify FAILED #", tk, " newSL:", newSL,
+                     " err:", tr.ResultRetcodeDescription());
          }
       }
       else // SELL
@@ -1033,10 +1077,15 @@ void ManagePositions()
          // SL NEVER moves up (for sells, lower = better)
          if(newSL < cSL || cSL == 0)
          {
-            if(tr.PositionModify(tk, newSL, cTP))
+            bool ok = tr.PositionModify(tk, newSL, cTP);
+            if(ok)
                Print("↓ SL→+$", DoubleToString(targetLockUSD,2),
                      " (max:$", DoubleToString(maxProf,2),
-                     " now:$", DoubleToString(prof,2), ") #", tk);
+                     " now:$", DoubleToString(prof,2),
+                     " ppp:", DoubleToString(ppp,4), ") #", tk);
+            else
+               Print("⚠ SL modify FAILED #", tk, " newSL:", newSL,
+                     " err:", tr.ResultRetcodeDescription());
          }
       }
       
