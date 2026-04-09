@@ -58,6 +58,7 @@ input int            InpMaxTrades   = 2;             // Max Open Trades
 input double         InpMaxDD       = 15.0;          // Max Drawdown %
 input double         InpBaseRR      = 2.5;           // Risk:Reward Ratio
 input double         InpATR_SL      = 1.8;           // ATR multiplier for SL
+input double         InpMaxSL_USD   = 2.0;           // MAX SL in $ (hard limit)
 input int            InpMagic       = 707070;        // Magic Number
 
 input group "═══════ SCORING (weights 0-10) ═══════"
@@ -76,19 +77,17 @@ input int            InpW_Engulf    = 6;     // Weight: Engulfing/PinBar
 input int            InpW_Volume    = 3;     // Weight: Volume Confirm
 input int            InpMinScore    = 25;    // Minimum Score to Enter
 
-input group "═══════ BREAKEVEN (3-layer) ═══════"
+input group "═══════ BREAKEVEN ($-based for small accounts) ═══════"
 input bool           InpUseBE       = true;
-input int            InpBE1_At      = 15;    // Layer 1: trigger (pts)
-input int            InpBE1_Lock    = 3;     // Layer 1: lock (pts)
-input int            InpBE2_At      = 30;    // Layer 2: trigger (pts)
-input int            InpBE2_Lock    = 15;    // Layer 2: lock (pts)
-input int            InpBE3_At      = 50;    // Layer 3: trigger (pts)
-input int            InpBE3_Lock    = 35;    // Layer 3: lock (pts)
+input double         InpBE1_AtUSD   = 1.50;  // Layer 1: at +$1.50 profit
+input double         InpBE1_LockUSD = 0.30;  // Layer 1: lock +$0.30
+input double         InpBE2_AtUSD   = 3.00;  // Layer 2: at +$3.00
+input double         InpBE2_LockUSD = 1.50;  // Layer 2: lock +$1.50
+input double         InpBE3_AtUSD   = 5.00;  // Layer 3: at +$5.00
+input double         InpBE3_LockUSD = 3.00;  // Layer 3: lock +$3.00
 
 input group "═══════ TRAILING STOP ═══════"
-input bool           InpTrail       = true;
-input int            InpTrailStart  = 40;    // Trail start (pts)
-input int            InpTrailStep   = 18;    // Trail step (pts)
+input bool           InpTrail       = true;   // Enable trailing
 
 input group "═══════ TIME CLOSE ═══════"
 input bool           InpTimeClose   = true;
@@ -827,14 +826,34 @@ void OpenTrade(int dir)
       if(hf&&fSL>0&&fSL>sl&&fSL<bid) sl=fSL;
       double asl=bid-sl;
       if(asl<10*pt){asl=10*pt;sl=bid-asl;}
+      
+      // Calculate lot first, then cap SL to $MaxSL
+      double lot=CalcLot(asl);
+      
+      // Cap SL to max $ loss
+      if(InpMaxSL_USD > 0 && lot > 0)
+      {
+         double tv=si.TickValue(), ts=si.TickSize();
+         if(tv>0 && ts>0)
+         {
+            double profPerPt = lot * tv / ts;
+            double maxDist = InpMaxSL_USD / profPerPt;
+            if(asl > maxDist)
+            {
+               asl = maxDist;
+               sl = NormalizeDouble(bid - asl, si.Digits());
+               Print("SL capped to $", DoubleToString(InpMaxSL_USD,2), " dist:", DoubleToString(asl/pt,0), "pts");
+            }
+         }
+      }
+      
       tp=bid+asl*InpBaseRR;
       for(int i=0;i<ArraySize(SNRs);i++)
         if(SNRs[i].tp==-1&&SNRs[i].p>bid&&SNRs[i].p<tp)
         { double at=SNRs[i].p-3*pt; if((at-bid)>=asl*1.5) tp=at; }
-      double lot=CalcLot(asl);
       sl=NormalizeDouble(sl,si.Digits());tp=NormalizeDouble(tp,si.Digits());
       if(tr.Buy(lot,_Symbol,ask,sl,tp,"SM7_BUY"))
-        Print("✓ BUY ",lot," SL:",sl," TP:",tp," RR:",DoubleToString((tp-ask)/asl,1));
+        Print("✓ BUY ",lot," SL:",sl," TP:",tp," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
    }
    else
    {
@@ -845,14 +864,33 @@ void OpenTrade(int dir)
       if(hf&&fSL>0&&fSL<sl&&fSL>ask) sl=fSL;
       double asl=sl-ask;
       if(asl<10*pt){asl=10*pt;sl=ask+asl;}
+      
+      double lot=CalcLot(asl);
+      
+      // Cap SL to max $ loss
+      if(InpMaxSL_USD > 0 && lot > 0)
+      {
+         double tv=si.TickValue(), ts=si.TickSize();
+         if(tv>0 && ts>0)
+         {
+            double profPerPt = lot * tv / ts;
+            double maxDist = InpMaxSL_USD / profPerPt;
+            if(asl > maxDist)
+            {
+               asl = maxDist;
+               sl = NormalizeDouble(ask + asl, si.Digits());
+               Print("SL capped to $", DoubleToString(InpMaxSL_USD,2), " dist:", DoubleToString(asl/pt,0), "pts");
+            }
+         }
+      }
+      
       tp=ask-asl*InpBaseRR;
       for(int i=0;i<ArraySize(SNRs);i++)
         if(SNRs[i].tp==1&&SNRs[i].p<ask&&SNRs[i].p>tp)
         { double at=SNRs[i].p+3*pt; if((ask-at)>=asl*1.5) tp=at; }
-      double lot=CalcLot(asl);
       sl=NormalizeDouble(sl,si.Digits());tp=NormalizeDouble(tp,si.Digits());
       if(tr.Sell(lot,_Symbol,bid,sl,tp,"SM7_SELL"))
-        Print("✓ SELL ",lot," SL:",sl," TP:",tp," RR:",DoubleToString((bid-tp)/asl,1));
+        Print("✓ SELL ",lot," SL:",sl," TP:",tp," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
    }
 }
 
@@ -876,41 +914,149 @@ double CalcLot(double slD)
 //+------------------------------------------------------------------+
 void ManagePositions()
 {
-   double pt=si.Point();
-   for(int i=PositionsTotal()-1;i>=0;i--)
+   double pt = si.Point();
+   
+   for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       if(!pi.SelectByIndex(i)) continue;
-      if(pi.Magic()!=InpMagic||pi.Symbol()!=_Symbol) continue;
-      double op=pi.PriceOpen(),cSL=pi.StopLoss(),cTP=pi.TakeProfit();
-      double prof=pi.Profit(); datetime ot=pi.Time(); ulong tk=pi.Ticket();
+      if(pi.Magic() != InpMagic || pi.Symbol() != _Symbol) continue;
       
-      if(pi.PositionType()==POSITION_TYPE_BUY)
+      double op    = pi.PriceOpen();
+      double cSL   = pi.StopLoss();
+      double cTP   = pi.TakeProfit();
+      double prof  = pi.Profit();
+      double vol   = pi.Volume();
+      datetime ot  = pi.Time();
+      ulong  tk    = pi.Ticket();
+      
+      //--- Convert $ to price distance
+      //    profitPerPoint = volume * tickValue / tickSize
+      double tv = si.TickValue();
+      double ts = si.TickSize();
+      double profPerPt = (tv > 0 && ts > 0) ? (vol * tv / ts) : 0;
+      
+      //--- EMERGENCY: close if loss exceeds $MaxSL
+      if(InpMaxSL_USD > 0 && prof <= -InpMaxSL_USD)
       {
-         double bid=si.Bid(),pips=(bid-op)/pt;
-         if(InpUseBE&&pips>=InpBE1_At&&cSL<op)
-         {double ns=NormalizeDouble(op+InpBE1_Lock*pt,si.Digits());if(ns>cSL)tr.PositionModify(tk,ns,cTP);}
-         if(InpUseBE&&pips>=InpBE2_At)
-         {double ns=NormalizeDouble(op+InpBE2_Lock*pt,si.Digits());if(ns>cSL)tr.PositionModify(tk,ns,cTP);}
-         if(InpUseBE&&pips>=InpBE3_At)
-         {double ns=NormalizeDouble(op+InpBE3_Lock*pt,si.Digits());if(ns>cSL)tr.PositionModify(tk,ns,cTP);}
-         if(InpTrail&&pips>=InpTrailStart)
-         {double ns=NormalizeDouble(bid-InpTrailStep*pt,si.Digits());if(ns>cSL+pt)tr.PositionModify(tk,ns,cTP);}
-         if(InpTimeClose&&prof>=InpTC_MinProf)
-         {int el=(int)(TimeCurrent()-ot)/60;if(el>=InpTC_Min)tr.PositionClose(tk);}
+         tr.PositionClose(tk);
+         Print("✗ EMERGENCY CLOSE #", tk, " Loss: $", DoubleToString(prof,2),
+               " exceeded max $", DoubleToString(InpMaxSL_USD,2));
+         continue;
       }
-      else
+      
+      if(pi.PositionType() == POSITION_TYPE_BUY)
       {
-         double ask=si.Ask(),pips=(op-ask)/pt;
-         if(InpUseBE&&pips>=InpBE1_At&&(cSL>op||cSL==0))
-         {double ns=NormalizeDouble(op-InpBE1_Lock*pt,si.Digits());if(ns<cSL||cSL==0)tr.PositionModify(tk,ns,cTP);}
-         if(InpUseBE&&pips>=InpBE2_At)
-         {double ns=NormalizeDouble(op-InpBE2_Lock*pt,si.Digits());if(ns<cSL||cSL==0)tr.PositionModify(tk,ns,cTP);}
-         if(InpUseBE&&pips>=InpBE3_At)
-         {double ns=NormalizeDouble(op-InpBE3_Lock*pt,si.Digits());if(ns<cSL||cSL==0)tr.PositionModify(tk,ns,cTP);}
-         if(InpTrail&&pips>=InpTrailStart)
-         {double ns=NormalizeDouble(ask+InpTrailStep*pt,si.Digits());if(ns<cSL-pt||cSL==0)tr.PositionModify(tk,ns,cTP);}
-         if(InpTimeClose&&prof>=InpTC_MinProf)
-         {int el=(int)(TimeCurrent()-ot)/60;if(el>=InpTC_Min)tr.PositionClose(tk);}
+         double bid = si.Bid();
+         
+         //=== $-BASED BREAKEVEN ===
+         if(InpUseBE && profPerPt > 0)
+         {
+            // Layer 1
+            if(prof >= InpBE1_AtUSD && cSL < op)
+            {
+               double lockDist = InpBE1_LockUSD / profPerPt;
+               double ns = NormalizeDouble(op + lockDist, si.Digits());
+               if(ns > cSL)
+               {
+                  tr.PositionModify(tk, ns, cTP);
+                  Print("→ BE1: SL→+$", DoubleToString(InpBE1_LockUSD,2), " #", tk,
+                        " Profit:$", DoubleToString(prof,2));
+               }
+            }
+            // Layer 2
+            if(prof >= InpBE2_AtUSD)
+            {
+               double lockDist = InpBE2_LockUSD / profPerPt;
+               double ns = NormalizeDouble(op + lockDist, si.Digits());
+               if(ns > cSL)
+                  tr.PositionModify(tk, ns, cTP);
+            }
+            // Layer 3
+            if(prof >= InpBE3_AtUSD)
+            {
+               double lockDist = InpBE3_LockUSD / profPerPt;
+               double ns = NormalizeDouble(op + lockDist, si.Digits());
+               if(ns > cSL)
+                  tr.PositionModify(tk, ns, cTP);
+            }
+         }
+         
+         //=== TRAILING (also $-based) ===
+         if(InpTrail && prof >= InpBE2_AtUSD)
+         {
+            double trailDist = InpBE1_AtUSD / profPerPt; // trail by $1.50
+            double ns = NormalizeDouble(bid - trailDist, si.Digits());
+            if(ns > cSL + pt && ns > op)
+               tr.PositionModify(tk, ns, cTP);
+         }
+         
+         //=== TIME CLOSE ===
+         if(InpTimeClose && prof >= InpTC_MinProf)
+         {
+            int el = (int)(TimeCurrent() - ot) / 60;
+            if(el >= InpTC_Min)
+            {
+               tr.PositionClose(tk);
+               Print("⏱ Time close #", tk, " +$", DoubleToString(prof,2));
+            }
+         }
+      }
+      else // SELL
+      {
+         double ask = si.Ask();
+         
+         //=== $-BASED BREAKEVEN ===
+         if(InpUseBE && profPerPt > 0)
+         {
+            // Layer 1
+            if(prof >= InpBE1_AtUSD && (cSL > op || cSL == 0))
+            {
+               double lockDist = InpBE1_LockUSD / profPerPt;
+               double ns = NormalizeDouble(op - lockDist, si.Digits());
+               if(ns < cSL || cSL == 0)
+               {
+                  tr.PositionModify(tk, ns, cTP);
+                  Print("→ BE1: SL→+$", DoubleToString(InpBE1_LockUSD,2), " #", tk,
+                        " Profit:$", DoubleToString(prof,2));
+               }
+            }
+            // Layer 2
+            if(prof >= InpBE2_AtUSD)
+            {
+               double lockDist = InpBE2_LockUSD / profPerPt;
+               double ns = NormalizeDouble(op - lockDist, si.Digits());
+               if(ns < cSL || cSL == 0)
+                  tr.PositionModify(tk, ns, cTP);
+            }
+            // Layer 3
+            if(prof >= InpBE3_AtUSD)
+            {
+               double lockDist = InpBE3_LockUSD / profPerPt;
+               double ns = NormalizeDouble(op - lockDist, si.Digits());
+               if(ns < cSL || cSL == 0)
+                  tr.PositionModify(tk, ns, cTP);
+            }
+         }
+         
+         //=== TRAILING ===
+         if(InpTrail && prof >= InpBE2_AtUSD)
+         {
+            double trailDist = InpBE1_AtUSD / profPerPt;
+            double ns = NormalizeDouble(ask + trailDist, si.Digits());
+            if((ns < cSL - pt || cSL == 0) && ns < op)
+               tr.PositionModify(tk, ns, cTP);
+         }
+         
+         //=== TIME CLOSE ===
+         if(InpTimeClose && prof >= InpTC_MinProf)
+         {
+            int el = (int)(TimeCurrent() - ot) / 60;
+            if(el >= InpTC_Min)
+            {
+               tr.PositionClose(tk);
+               Print("⏱ Time close #", tk, " +$", DoubleToString(prof,2));
+            }
+         }
       }
    }
 }
