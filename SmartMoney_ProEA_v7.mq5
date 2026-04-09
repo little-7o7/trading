@@ -329,13 +329,17 @@ void OnDeinit(const int r)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   ManagePositions(); // every tick
+   //--- ALWAYS refresh price FIRST (for BE to work on every tick)
+   si.Refresh();
+   si.RefreshRates();
    
+   //--- Manage positions EVERY TICK (critical for BE)
+   ManagePositions();
+   
+   //--- New bar check for analysis + signals
    datetime cb = iTime(_Symbol, entryTF, 0);
    if(cb == lastBar) return;
    lastBar = cb;
-   
-   si.Refresh(); si.RefreshRates();
    if(CheckDD()) return;
    double b = ai.Balance(); if(b > peakBal) peakBal = b;
    if(!CopyBufs()) return;
@@ -996,28 +1000,29 @@ void ManagePositions()
       datetime ot = pi.Time();
       ulong  tk   = pi.Ticket();
       
-      // $ per point for this position
-      // Method: derive from actual profit and price distance (works on ALL instruments)
+      // === Calculate $ per point (works for ALL instruments including GOLD) ===
+      // Use OrderCalcProfit to get accurate value
       double ppp = 0;
-      double priceDist = 0;
+      double testDist = 100 * si.Point(); // test with 100 points
+      double testProfit = 0;
       
       if(pi.PositionType() == POSITION_TYPE_BUY)
-         priceDist = si.Bid() - op;
-      else
-         priceDist = op - si.Ask();
-      
-      // If we have actual profit and price moved, calculate real $/point
-      if(MathAbs(priceDist) > pt && MathAbs(prof) > 0.001)
       {
-         ppp = MathAbs(prof / priceDist);
+         if(OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, vol, op, op + testDist, testProfit))
+            ppp = MathAbs(testProfit / testDist);
       }
       else
       {
-         // Fallback: use tick value formula
+         if(OrderCalcProfit(ORDER_TYPE_SELL, _Symbol, vol, op, op - testDist, testProfit))
+            ppp = MathAbs(testProfit / testDist);
+      }
+      
+      // Fallback
+      if(ppp <= 0)
+      {
          double tv = si.TickValue();
          double ts = si.TickSize();
-         if(tv > 0 && ts > 0)
-            ppp = vol * tv / ts;
+         if(tv > 0 && ts > 0) ppp = vol * tv / ts;
       }
       
       if(ppp <= 0) continue;
@@ -1076,8 +1081,34 @@ void ManagePositions()
       {
          double newSL = NormalizeDouble(op - lockDist, si.Digits());
          
-         // SL NEVER moves up (for sells, lower = better)
-         if(newSL < cSL || cSL == 0)
+         // For SELL: SL that locks profit is BELOW open price
+         // We want to move SL DOWN (closer to price) to lock profit
+         // SL should only move DOWN from initial SL, never back UP
+         // If cSL is above op (initial SL), any newSL below op is better
+         // If cSL is already below op (already in BE), only move if newSL is HIGHER (locks more)
+         
+         bool shouldMove = false;
+         if(cSL == 0)
+            shouldMove = true;                    // No SL set
+         else if(cSL > op && newSL < op)
+            shouldMove = true;                    // First BE: move from loss to profit
+         else if(cSL <= op && newSL < cSL)
+            shouldMove = false;                   // Would reduce lock - NEVER
+         else if(cSL <= op && newSL > cSL && newSL < op)
+            shouldMove = false;                   // newSL is between cSL and op - ambiguous, skip
+         else if(newSL < cSL)
+            shouldMove = true;                    // Moving SL closer to price (more protective)
+         
+         // Actually simpler: for SELL, "more profit locked" = SL closer to current ask
+         // So newSL should be LOWER than cSL (if cSL > op) OR HIGHER than cSL (if cSL < op)
+         // The key: newSL represents locking $X profit. If $X_new > $X_old, move SL.
+         // Since targetLockUSD only goes UP (maxProf tracking), just check if newSL != cSL
+         
+         // Simplest correct logic: newSL is calculated from op - lockDist
+         // lockDist is always positive and only grows
+         // So newSL only gets lower. For SELL that means more profit locked.
+         // Move if newSL < cSL (standard) OR if cSL is still above op (not yet in profit)
+         if(newSL < cSL || cSL == 0 || cSL > op)
          {
             bool ok = tr.PositionModify(tk, newSL, cTP);
             if(ok)
@@ -1087,6 +1118,7 @@ void ManagePositions()
                      " ppp:", DoubleToString(ppp,4), ") #", tk);
             else
                Print("⚠ SL modify FAILED #", tk, " newSL:", newSL,
+                     " cSL:", cSL, " op:", op,
                      " err:", tr.ResultRetcodeDescription());
          }
       }
