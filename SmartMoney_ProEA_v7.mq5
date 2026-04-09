@@ -56,9 +56,10 @@ input ENUM_RISK      InpRisk        = RISK_NORMAL;   // Risk Mode
 input double         InpMaxLot      = 0.05;          // Max Lot
 input int            InpMaxTrades   = 2;             // Max Open Trades
 input double         InpMaxDD       = 15.0;          // Max Drawdown %
-input double         InpBaseRR      = 2.5;           // Risk:Reward Ratio
+input double         InpBaseRR      = 3.0;           // Min R:R for SL calc (no TP used)
 input double         InpATR_SL      = 1.8;           // ATR multiplier for SL
 input double         InpMaxSL_USD   = 2.0;           // MAX SL in $ (hard limit)
+input bool           InpUseTP       = false;         // Use Take Profit (false=SL trail only)
 input int            InpMagic       = 707070;        // Magic Number
 
 input group "═══════ SCORING (weights 0-10) ═══════"
@@ -81,11 +82,15 @@ input group "═══════ SMART PROFIT PROTECTION ═══════
 input bool           InpUseBE       = true;
 input double         InpBE_StartUSD = 1.00;  // Start protecting at +$1
 input double         InpBE_FirstLock= 0.20;  // First lock: +$0.20
-input double         InpTrailPct    = 60.0;  // Protect % of max profit
-// Example: profit=$10 → SL locks $6 (60%)
-// Example: profit=$20 → SL locks $12 (60%)
-// Example: profit=$50 → SL locks $30 (60%)
-// SL ALWAYS moves UP, never down!
+input double         InpTrailPct    = 60.0;  // Protect % (up to $15 profit)
+input double         InpTrailFixed  = 5.0;   // Above $15: trail $5 below max
+// Up to $15 profit: SL = 60% of max profit
+// Above $15: SL = max profit - $5
+// Example: max=$8  → SL at +$4.80 (60%)
+// Example: max=$15 → SL at +$9.00 (60%)
+// Example: max=$20 → SL at +$15 ($20-$5)
+// Example: max=$50 → SL at +$45 ($50-$5)
+// SL NEVER goes backwards!
 
 input group "═══════ TRAILING STOP ═══════"
 input bool           InpTrail       = true;   // Enable trailing
@@ -799,11 +804,20 @@ int ScoreAndDecide()
    //=== DECISION ===
    int dir = 0;
    
-   // MUST meet minimum score AND align with HTF trend
-   if(bullScore >= InpMinScore && bullScore > bearScore && trendHTF >= 0)
+   // Score decides direction. HTF trend adds weight but does NOT block.
+   // If bearScore > bullScore and meets minimum, SELL is allowed even if HTF is flat.
+   if(bullScore >= InpMinScore && bullScore > bearScore)
       dir = 1;
-   else if(bearScore >= InpMinScore && bearScore > bullScore && trendHTF <= 0)
+   else if(bearScore >= InpMinScore && bearScore > bullScore)
       dir = -1;
+   
+   // Extra safety: if BOTH scores are above minimum, pick the stronger one
+   if(bullScore >= InpMinScore && bearScore >= InpMinScore)
+   {
+      if(bullScore > bearScore) dir = 1;
+      else if(bearScore > bullScore) dir = -1;
+      else dir = 0; // equal = no trade
+   }
    
    if(dir != 0)
    {
@@ -872,12 +886,17 @@ void OpenTrade(int dir)
       }
       
       tp=bid+asl*InpBaseRR;
-      for(int i=0;i<ArraySize(SNRs);i++)
-        if(SNRs[i].tp==-1&&SNRs[i].p>bid&&SNRs[i].p<tp)
-        { double at=SNRs[i].p-3*pt; if((at-bid)>=asl*1.5) tp=at; }
-      sl=NormalizeDouble(sl,si.Digits());tp=NormalizeDouble(tp,si.Digits());
+      if(!InpUseTP) tp = 0; // NO TP — let SL trail do the work
+      else
+      {
+         for(int i=0;i<ArraySize(SNRs);i++)
+           if(SNRs[i].tp==-1&&SNRs[i].p>bid&&SNRs[i].p<tp)
+           { double at=SNRs[i].p-3*pt; if((at-bid)>=asl*1.5) tp=at; }
+      }
+      sl=NormalizeDouble(sl,si.Digits());
+      if(tp>0) tp=NormalizeDouble(tp,si.Digits());
       if(tr.Buy(lot,_Symbol,ask,sl,tp,"SM7_BUY"))
-        Print("✓ BUY ",lot," SL:",sl," TP:",tp," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
+        Print("✓ BUY ",lot," SL:",sl," TP:",(tp>0?DoubleToString(tp,si.Digits()):"NONE")," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
    }
    else
    {
@@ -919,12 +938,17 @@ void OpenTrade(int dir)
       }
       
       tp=ask-asl*InpBaseRR;
-      for(int i=0;i<ArraySize(SNRs);i++)
-        if(SNRs[i].tp==1&&SNRs[i].p<ask&&SNRs[i].p>tp)
-        { double at=SNRs[i].p+3*pt; if((ask-at)>=asl*1.5) tp=at; }
-      sl=NormalizeDouble(sl,si.Digits());tp=NormalizeDouble(tp,si.Digits());
+      if(!InpUseTP) tp = 0; // NO TP — let SL trail do the work
+      else
+      {
+         for(int i=0;i<ArraySize(SNRs);i++)
+           if(SNRs[i].tp==1&&SNRs[i].p<ask&&SNRs[i].p>tp)
+           { double at=SNRs[i].p+3*pt; if((ask-at)>=asl*1.5) tp=at; }
+      }
+      sl=NormalizeDouble(sl,si.Digits());
+      if(tp>0) tp=NormalizeDouble(tp,si.Digits());
       if(tr.Sell(lot,_Symbol,bid,sl,tp,"SM7_SELL"))
-        Print("✓ SELL ",lot," SL:",sl," TP:",tp," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
+        Print("✓ SELL ",lot," SL:",sl," TP:",(tp>0?DoubleToString(tp,si.Digits()):"NONE")," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
    }
 }
 
@@ -1048,10 +1072,18 @@ void ManagePositions()
          // Phase 1: just breakeven + small lock
          targetLockUSD = InpBE_FirstLock;
       }
-      else if(maxProf >= InpBE_StartUSD * 2)
+      else if(maxProf >= InpBE_StartUSD * 2 && maxProf <= 15.0)
       {
-         // Phase 2: protect % of max profit (scales infinitely)
+         // Phase 2: protect 60% of max profit (up to $15)
          targetLockUSD = maxProf * InpTrailPct / 100.0;
+      }
+      else if(maxProf > 15.0)
+      {
+         // Phase 3: protect max profit minus $5 (tighter trail for big profits)
+         targetLockUSD = maxProf - InpTrailFixed;
+         // Safety: never less than 60% of 15 = $9
+         if(targetLockUSD < 15.0 * InpTrailPct / 100.0)
+            targetLockUSD = 15.0 * InpTrailPct / 100.0;
       }
       
       if(targetLockUSD <= 0) continue; // not yet in profit zone
@@ -1081,45 +1113,26 @@ void ManagePositions()
       {
          double newSL = NormalizeDouble(op - lockDist, si.Digits());
          
-         // For SELL: SL that locks profit is BELOW open price
-         // We want to move SL DOWN (closer to price) to lock profit
-         // SL should only move DOWN from initial SL, never back UP
-         // If cSL is above op (initial SL), any newSL below op is better
-         // If cSL is already below op (already in BE), only move if newSL is HIGHER (locks more)
-         
+         // For SELL: profit SL is BELOW open price
+         // newSL should be below op (in profit zone)
+         // Move SL if: no SL set, or SL is still above op (loss zone), or newSL locks MORE profit
          bool shouldMove = false;
-         if(cSL == 0)
-            shouldMove = true;                    // No SL set
-         else if(cSL > op && newSL < op)
-            shouldMove = true;                    // First BE: move from loss to profit
-         else if(cSL <= op && newSL < cSL)
-            shouldMove = false;                   // Would reduce lock - NEVER
-         else if(cSL <= op && newSL > cSL && newSL < op)
-            shouldMove = false;                   // newSL is between cSL and op - ambiguous, skip
-         else if(newSL < cSL)
-            shouldMove = true;                    // Moving SL closer to price (more protective)
          
-         // Actually simpler: for SELL, "more profit locked" = SL closer to current ask
-         // So newSL should be LOWER than cSL (if cSL > op) OR HIGHER than cSL (if cSL < op)
-         // The key: newSL represents locking $X profit. If $X_new > $X_old, move SL.
-         // Since targetLockUSD only goes UP (maxProf tracking), just check if newSL != cSL
+         if(cSL == 0)                          shouldMove = true;  // No SL
+         else if(cSL >= op && newSL < op)       shouldMove = true;  // Move from loss to profit zone
+         else if(cSL < op && newSL < cSL)       shouldMove = false; // Would REDUCE lock (newSL further from op)
+         else if(cSL < op && newSL > cSL && newSL < op) shouldMove = true; // Locks MORE (closer to op but still profit)
          
-         // Simplest correct logic: newSL is calculated from op - lockDist
-         // lockDist is always positive and only grows
-         // So newSL only gets lower. For SELL that means more profit locked.
-         // Move if newSL < cSL (standard) OR if cSL is still above op (not yet in profit)
-         if(newSL < cSL || cSL == 0 || cSL > op)
+         if(shouldMove)
          {
             bool ok = tr.PositionModify(tk, newSL, cTP);
             if(ok)
                Print("↓ SL→+$", DoubleToString(targetLockUSD,2),
                      " (max:$", DoubleToString(maxProf,2),
-                     " now:$", DoubleToString(prof,2),
-                     " ppp:", DoubleToString(ppp,4), ") #", tk);
+                     " now:$", DoubleToString(prof,2), ") #", tk);
             else
-               Print("⚠ SL modify FAILED #", tk, " newSL:", newSL,
-                     " cSL:", cSL, " op:", op,
-                     " err:", tr.ResultRetcodeDescription());
+               Print("⚠ SELL SL FAILED #", tk, " new:", newSL, " cur:", cSL,
+                     " op:", op, " err:", tr.ResultRetcodeDescription());
          }
       }
       
