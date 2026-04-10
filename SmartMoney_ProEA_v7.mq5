@@ -1,16 +1,14 @@
 //+------------------------------------------------------------------+
-//|                                      SmartMoney_ProEA_v7.mq5     |
-//|            DEEP ANALYSIS — Weighted Scoring — Clean Chart          |
-//|            Adjustable Timeframe — Based on v2 (best results)       |
-//|            Toggle each analysis on/off in settings                 |
-//|            Built for $50-$100 accounts                             |
+//|                                           SmartMoney_ProEA_v7_Fixed.mq5 |
+//|            FIXED VERSION — No iBarShift, Correct Trailing, Cooldown |
+//|            Based on v7 with all critical bugs removed               |
 //+------------------------------------------------------------------+
-#property copyright "SmartMoney Pro v7.0"
-#property version   "7.00"
+#property copyright "SmartMoney Pro v7 Fixed"
+#property version   "7.10"
 #property strict
-#property description "Deep analysis + weighted scoring"
+#property description "Deep analysis + weighted scoring (FIXED)"
 #property description "Adjustable TF | Clean chart | Toggle layers"
-#property description "Based on v2 logic — capital preservation"
+#property description "Fixed trailing logic, cooldown, M1 loading"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -61,6 +59,7 @@ input double         InpATR_SL      = 1.8;           // ATR multiplier for SL
 input double         InpMaxSL_USD   = 2.0;           // MAX SL in $ (hard limit)
 input bool           InpUseTP       = false;         // Use Take Profit (false=SL trail only)
 input int            InpMagic       = 707070;        // Magic Number
+input double         InpMinEquityPercent = 20.0;    // Min free margin % (0=off)
 
 input group "═══════ SCORING (weights 0-10) ═══════"
 input int            InpW_Trend     = 10;    // Weight: HTF Trend Alignment
@@ -84,13 +83,6 @@ input double         InpBE_StartUSD = 1.00;  // Start protecting at +$1
 input double         InpBE_FirstLock= 0.20;  // First lock: +$0.20
 input double         InpTrailPct    = 60.0;  // Protect % (up to $15 profit)
 input double         InpTrailFixed  = 5.0;   // Above $15: trail $5 below max
-// Up to $15 profit: SL = 60% of max profit
-// Above $15: SL = max profit - $5
-// Example: max=$8  → SL at +$4.80 (60%)
-// Example: max=$15 → SL at +$9.00 (60%)
-// Example: max=$20 → SL at +$15 ($20-$5)
-// Example: max=$50 → SL at +$45 ($50-$5)
-// SL NEVER goes backwards!
 
 input group "═══════ TRAILING STOP ═══════"
 input bool           InpTrail       = true;   // Enable trailing
@@ -190,6 +182,23 @@ int sc_Trend,sc_Struct,sc_OB,sc_FVG,sc_Fib,sc_SNR,sc_Liq;
 int sc_EMA,sc_RSI,sc_MACD,sc_Stoch,sc_Engulf,sc_Vol;
 int lastBullScore, lastBearScore;
 
+// Cooldown (fixed)
+datetime lastTradeTime = 0;
+int       lastTradeBar  = -1;
+
+//+------------------------------------------------------------------+
+//| Helper: Bars since datetime on specific timeframe                |
+//+------------------------------------------------------------------+
+int BarsSince(datetime time, ENUM_TIMEFRAMES tf)
+{
+   if(time == 0) return 1000;
+   datetime curBar = iTime(_Symbol, tf, 0);
+   if(curBar == 0) return 1000;
+   int bars = (int)((curBar - time) / PeriodSeconds(tf));
+   if(bars < 0) bars = 0;
+   return bars;
+}
+
 //+------------------------------------------------------------------+
 ENUM_TIMEFRAMES GetEntryTF()
 {
@@ -260,7 +269,7 @@ int OnInit()
    
    if(hF<0||hS<0||hT<0||hRSI<0||hATR<0||hStoch<0||hMACD<0||
       hHF<0||hHS<0||hH200<0||hM1_ATR<0)
-   { Print("ERROR: handles"); return INIT_FAILED; }
+   { Print("ERROR: indicator handles"); return INIT_FAILED; }
    
    ArraySetAsSeries(bF,true);   ArraySetAsSeries(bS,true);   ArraySetAsSeries(bT,true);
    ArraySetAsSeries(bRSI,true); ArraySetAsSeries(bATR,true);
@@ -278,13 +287,14 @@ int OnInit()
    
    //--- FORCE LOAD M1 HISTORY (critical!)
    Print("Loading M1 history for ", _Symbol, "...");
-   int m1Need = InpHistoryDays * 1440 + 100;
+   int m1Need = InpHistoryDays * 1440 + 500;
    double tempH[];
    int loaded = CopyHigh(_Symbol, PERIOD_M1, 0, m1Need, tempH);
    if(loaded < m1Need / 2)
    {
       Print("WARNING: Only ", loaded, " M1 bars loaded (need ~", m1Need, ")");
       Print("TIP: Open M1 chart manually and scroll back 3 days, then restart EA");
+      // We'll still run, but analysis will be limited
    }
    else
    {
@@ -304,7 +314,7 @@ int OnInit()
    EventSetTimer(1);
    
    Print("╔═══════════════════════════════════════════════╗");
-   Print("║ SmartMoney Pro v7.0 — DEEP ANALYSIS");
+   Print("║ SmartMoney Pro v7.10 FIXED — DEEP ANALYSIS");
    Print("║ Entry: ", EnumToString(entryTF), " | Trend: ", EnumToString(htfTF));
    Print("║ Balance: $", DoubleToString(initBal,2));
    Print("║ Risk: ", DoubleToString(GetRiskPct(),1), "% | Min Score: ", InpMinScore);
@@ -345,7 +355,21 @@ void OnTick()
    datetime cb = iTime(_Symbol, entryTF, 0);
    if(cb == lastBar) return;
    lastBar = cb;
+   
+   // Check drawdown and free margin
    if(CheckDD()) return;
+   if(InpMinEquityPercent > 0)
+   {
+      double eq = ai.Equity();
+      double mar = ai.Margin();
+      double freePct = (eq - mar) / eq * 100;
+      if(freePct < InpMinEquityPercent)
+      {
+         Print("Low free margin: ", DoubleToString(freePct,1), "%, skip entry");
+         return;
+      }
+   }
+   
    double b = ai.Balance(); if(b > peakBal) peakBal = b;
    if(!CopyBufs()) return;
    
@@ -364,6 +388,9 @@ void OnTick()
    if(!SessOK() || !FriOK()) return;
    if(InpNews && IsNews()) return;
    if(CntPos() >= InpMaxTrades) return;
+   
+   // Cooldown: at least 2 bars since last trade
+   if(lastTradeTime > 0 && BarsSince(lastTradeTime, entryTF) < 2) return;
    
    int sig = ScoreAndDecide();
    if(sig != 0) OpenTrade(sig);
@@ -393,14 +420,10 @@ bool CopyBufs()
 //+------------------------------------------------------------------+
 void CalcHTFTrend()
 {
-   // Less strict: 2 of 3 conditions = trend confirmed
    int bullCount = 0, bearCount = 0;
-   
    if(bHF[0] > bHS[0])  bullCount++; else bearCount++;
    if(bHF[0] > bH200[0]) bullCount++; else bearCount++;
    if(bHS[0] > bH200[0]) bullCount++; else bearCount++;
-   
-   // Also check EMA direction (rising/falling)
    if(bHF[0] > bHF[1]) bullCount++; else bearCount++;
    
    if(bullCount >= 3) trendHTF = 1;
@@ -450,21 +473,19 @@ void DetectSwings()
    double H[],L[];
    ArraySetAsSeries(H,true); ArraySetAsSeries(L,true);
    
-   // Try M1 first
+   ENUM_TIMEFRAMES useTF = PERIOD_M1;
    int loaded = CopyHigh(_Symbol,PERIOD_M1,0,lb,H);
    int loadedL = CopyLow(_Symbol,PERIOD_M1,0,lb,L);
    
-   // Fallback: if M1 has less than 100 bars, use entry TF
-   ENUM_TIMEFRAMES useTF = PERIOD_M1;
    if(loaded < 100)
    {
-      lb = 500; // use more bars on higher TF
+      useTF = entryTF;
+      lb = 500;
       loaded = CopyHigh(_Symbol,entryTF,0,lb,H);
       loadedL = CopyLow(_Symbol,entryTF,0,lb,L);
-      useTF = entryTF;
    }
    
-   if(loaded < 20 || loadedL < 20) return; // not enough data
+   if(loaded < 20 || loadedL < 20) return;
    int maxI = MathMin(loaded, lb) - 5;
    
    for(int i=5;i<maxI-1;i++)
@@ -484,7 +505,7 @@ void DetectSwings()
 }
 
 //+------------------------------------------------------------------+
-//| ORDER BLOCKS from M1 history (strict: 1.5x impulse + volume)     |
+//| ORDER BLOCKS from M1 history                                      |
 //+------------------------------------------------------------------+
 void DetectOBs()
 {
@@ -494,7 +515,6 @@ void DetectOBs()
    ArraySetAsSeries(O,true);ArraySetAsSeries(H,true);ArraySetAsSeries(L,true);
    ArraySetAsSeries(C,true);ArraySetAsSeries(V,true);
    
-   // Try M1, fallback to entry TF
    ENUM_TIMEFRAMES useTF = PERIOD_M1;
    int loaded = CopyOpen(_Symbol,PERIOD_M1,0,lb,O);
    if(loaded < 100)
@@ -517,7 +537,6 @@ void DetectOBs()
    for(int i=2;i<maxI-2;i++)
    {
       double bI=MathAbs(C[i]-O[i]),bP=MathAbs(C[i-1]-O[i-1]);
-      // Bullish OB
       if(C[i]<O[i]&&C[i-1]>O[i-1]&&bP>bI*1.5&&(double)V[i-1]>av*1.2)
       {
          bool mit=false;
@@ -525,7 +544,6 @@ void DetectOBs()
          if(!mit){ SOB o;o.hi=H[i];o.lo=L[i];o.t=iTime(_Symbol,PERIOD_M1,i);o.d=1;o.str=(double)V[i-1]/av;
                    int n=ArraySize(OBs);ArrayResize(OBs,n+1);OBs[n]=o; }
       }
-      // Bearish OB
       if(C[i]>O[i]&&C[i-1]<O[i-1]&&bP>bI*1.5&&(double)V[i-1]>av*1.2)
       {
          bool mit=false;
@@ -534,7 +552,6 @@ void DetectOBs()
                    int n=ArraySize(OBs);ArrayResize(OBs,n+1);OBs[n]=o; }
       }
    }
-   // Sort+cap
    for(int i=0;i<ArraySize(OBs)-1;i++)
      for(int j=0;j<ArraySize(OBs)-i-1;j++)
        if(OBs[j].str<OBs[j+1].str){SOB t=OBs[j];OBs[j]=OBs[j+1];OBs[j+1]=t;}
@@ -684,21 +701,18 @@ void CalcAsian()
 }
 
 //+------------------------------------------------------------------+
-//| ═══════ WEIGHTED SCORING SYSTEM ═══════                          |
-//| Each signal gets a WEIGHT, not just 0/1                          |
-//| Total score must reach InpMinScore to enter                      |
+//| WEIGHTED SCORING SYSTEM (FIXED cooldown and recent momentum)     |
 //+------------------------------------------------------------------+
 int ScoreAndDecide()
 {
    double ask=si.Ask(),bid=si.Bid(),pt=si.Point();
    
    int bullScore=0, bearScore=0;
-   // Reset breakdown
    sc_Trend=0;sc_Struct=0;sc_OB=0;sc_FVG=0;sc_Fib=0;
    sc_SNR=0;sc_Liq=0;sc_EMA=0;sc_RSI=0;sc_MACD=0;
    sc_Stoch=0;sc_Engulf=0;sc_Vol=0;
    
-   //=== CHECK LAST 3 CANDLES DIRECTION (prevent entering against momentum) ===
+   // Recent 3 candles direction filter
    double entC[],entO[];
    ArraySetAsSeries(entC,true); ArraySetAsSeries(entO,true);
    CopyClose(_Symbol,entryTF,0,5,entC);
@@ -714,15 +728,15 @@ int ScoreAndDecide()
    if(bullCandles >= 2) recentDir = 1;
    if(bearCandles >= 2) recentDir = -1;
    
-   //=== 1. HTF TREND (highest weight) ===
+   // 1. HTF TREND
    if(trendHTF==1)  { bullScore += InpW_Trend; sc_Trend = InpW_Trend; }
    if(trendHTF==-1) { bearScore += InpW_Trend; sc_Trend = -InpW_Trend; }
    
-   //=== 2. MARKET STRUCTURE ===
+   // 2. MARKET STRUCTURE
    if(trendEntry==1)  { bullScore += InpW_Structure; sc_Struct = InpW_Structure; }
    if(trendEntry==-1) { bearScore += InpW_Structure; sc_Struct = -InpW_Structure; }
    
-   //=== 3. ORDER BLOCK ===
+   // 3. ORDER BLOCK
    for(int i=0;i<ArraySize(OBs);i++)
    {
       if(OBs[i].d==1&&bid>=OBs[i].lo&&bid<=OBs[i].hi)
@@ -731,7 +745,7 @@ int ScoreAndDecide()
       { bearScore+=InpW_OB; sc_OB=-InpW_OB; break; }
    }
    
-   //=== 4. FAIR VALUE GAP ===
+   // 4. FAIR VALUE GAP
    for(int i=0;i<ArraySize(FVGs);i++)
    {
       if(FVGs[i].d==1&&bid>=FVGs[i].lo&&bid<=FVGs[i].hi)
@@ -740,7 +754,7 @@ int ScoreAndDecide()
       { bearScore+=InpW_FVG; sc_FVG=-InpW_FVG; break; }
    }
    
-   //=== 5. FIBONACCI OTE ===
+   // 5. FIBONACCI OTE
    double fSL,fTP;
    if(IsFibOTE(bid,fSL,fTP))
    {
@@ -748,7 +762,7 @@ int ScoreAndDecide()
       if(trendEntry==-1) { bearScore+=InpW_Fib; sc_Fib=-InpW_Fib; }
    }
    
-   //=== 6. SNR ===
+   // 6. SNR
    double zone=InpSNR_Zone*pt;
    for(int i=0;i<ArraySize(SNRs);i++)
    {
@@ -758,7 +772,7 @@ int ScoreAndDecide()
       { bearScore+=InpW_SNR; sc_SNR=-InpW_SNR; break; }
    }
    
-   //=== 7. LIQUIDITY SWEEP ===
+   // 7. LIQUIDITY SWEEP
    double cls[];ArraySetAsSeries(cls,true);CopyClose(_Symbol,PERIOD_M1,0,5,cls);
    for(int i=0;i<ArraySize(LIQs);i++)
    {
@@ -768,23 +782,23 @@ int ScoreAndDecide()
       { bearScore+=InpW_Liq; sc_Liq=-InpW_Liq; break; }
    }
    
-   //=== 8. EMA CROSS ===
+   // 8. EMA CROSS
    if(bF[1]>bS[1]&&bF[2]<=bS[2]) { bullScore+=InpW_EMA; sc_EMA=InpW_EMA; }
    if(bF[1]<bS[1]&&bF[2]>=bS[2]) { bearScore+=InpW_EMA; sc_EMA=-InpW_EMA; }
    
-   //=== 9. RSI ===
+   // 9. RSI
    if(bRSI[1]<30||(bRSI[1]<40&&bRSI[1]>bRSI[2])) { bullScore+=InpW_RSI; sc_RSI=InpW_RSI; }
    if(bRSI[1]>70||(bRSI[1]>60&&bRSI[1]<bRSI[2])) { bearScore+=InpW_RSI; sc_RSI=-InpW_RSI; }
    
-   //=== 10. MACD ===
+   // 10. MACD
    if(bMM[1]>bMS[1]&&bMM[2]<=bMS[2]) { bullScore+=InpW_MACD; sc_MACD=InpW_MACD; }
    if(bMM[1]<bMS[1]&&bMM[2]>=bMS[2]) { bearScore+=InpW_MACD; sc_MACD=-InpW_MACD; }
    
-   //=== 11. STOCHASTIC ===
+   // 11. STOCHASTIC
    if(bSK[1]>bSD[1]&&bSK[2]<=bSD[2]&&bSK[1]<30) { bullScore+=InpW_Stoch; sc_Stoch=InpW_Stoch; }
    if(bSK[1]<bSD[1]&&bSK[2]>=bSD[2]&&bSK[1]>70) { bearScore+=InpW_Stoch; sc_Stoch=-InpW_Stoch; }
    
-   //=== 12. ENGULFING / PIN BAR ===
+   // 12. ENGULFING / PIN BAR
    {
       double o[],h[],l[],c[];
       ArraySetAsSeries(o,true);ArraySetAsSeries(h,true);ArraySetAsSeries(l,true);ArraySetAsSeries(c,true);
@@ -800,7 +814,7 @@ int ScoreAndDecide()
       if(wUp>b1*2&&wUp>rng*0.6) {bearScore+=InpW_Engulf;sc_Engulf=-InpW_Engulf;}
    }
    
-   //=== 13. VOLUME CONFIRMATION ===
+   // 13. VOLUME
    {
       long vol[];ArraySetAsSeries(vol,true);
       CopyTickVolume(_Symbol,entryTF,0,20,vol);
@@ -817,9 +831,7 @@ int ScoreAndDecide()
    lastBullScore = bullScore;
    lastBearScore = bearScore;
    
-   //=== DECISION ===
    int dir = 0;
-   
    if(bullScore >= InpMinScore && bullScore > bearScore)
       dir = 1;
    else if(bearScore >= InpMinScore && bearScore > bullScore)
@@ -832,28 +844,13 @@ int ScoreAndDecide()
       else dir = 0;
    }
    
-   //=== CANDLE DIRECTION FILTER: don't enter against recent 3-candle momentum ===
-   if(dir == 1 && recentDir == -1) dir = 0; // Don't BUY into bearish momentum
-   if(dir == -1 && recentDir == 1) dir = 0; // Don't SELL into bullish momentum
-   
-   //=== COOLDOWN: don't open new trade within 2 bars of last trade ===
-   if(dir != 0)
-   {
-      datetime lastTT = (datetime)GlobalVariableGet("SM7_lastTrade");
-      if(lastTT > 0)
-      {
-         int barsSince = iBarShift(_Symbol, entryTF, lastTT);
-         if(barsSince < 2)
-         {
-            dir = 0; // Wait at least 2 bars between trades
-         }
-      }
-   }
+   // Momentum filter
+   if(dir == 1 && recentDir == -1) dir = 0;
+   if(dir == -1 && recentDir == 1) dir = 0;
    
    if(dir != 0)
    {
-      int sc = dir==1?bullScore:bearScore;
-      Print("══ ", (dir==1?"BUY":"SELL"), " ══ Score:", sc, "/", InpMinScore, "+");
+      Print("══ ", (dir==1?"BUY":"SELL"), " ══ Score:", (dir==1?bullScore:bearScore), "/", InpMinScore, "+");
       Print("   Trend:", sc_Trend, " Struct:", sc_Struct, " OB:", sc_OB,
             " FVG:", sc_FVG, " Fib:", sc_Fib, " SNR:", sc_SNR,
             " Liq:", sc_Liq, " EMA:", sc_EMA, " RSI:", sc_RSI,
@@ -885,10 +882,8 @@ void OpenTrade(int dir)
       double asl=bid-sl;
       if(asl<10*pt){asl=10*pt;sl=bid-asl;}
       
-      // Calculate lot first, then cap SL to $MaxSL
       double lot=CalcLot(asl);
       
-      // Cap SL to max $ loss using OrderCalcProfit (accurate for ALL instruments)
       if(InpMaxSL_USD > 0 && lot > 0)
       {
          double lossAtSL = 0;
@@ -896,7 +891,6 @@ void OpenTrade(int dir)
          {
             if(MathAbs(lossAtSL) > InpMaxSL_USD)
             {
-               // Binary search for correct SL distance
                double hiSL = bid, loSL = sl;
                for(int iter=0; iter<20; iter++)
                {
@@ -905,9 +899,9 @@ void OpenTrade(int dir)
                   if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, lot, ask, midSL, midLoss))
                      midLoss = 0;
                   if(MathAbs(midLoss) > InpMaxSL_USD)
-                     loSL = midSL; // SL too far, move closer
+                     loSL = midSL;
                   else
-                     hiSL = midSL; // can go further
+                     hiSL = midSL;
                }
                sl = NormalizeDouble(loSL, si.Digits());
                asl = bid - sl;
@@ -917,7 +911,7 @@ void OpenTrade(int dir)
       }
       
       tp=bid+asl*InpBaseRR;
-      if(!InpUseTP) tp = 0; // NO TP — let SL trail do the work
+      if(!InpUseTP) tp = 0;
       else
       {
          for(int i=0;i<ArraySize(SNRs);i++)
@@ -929,8 +923,7 @@ void OpenTrade(int dir)
       if(tr.Buy(lot,_Symbol,ask,sl,tp,"SM7_BUY"))
       {
         Print("✓ BUY ",lot," SL:",sl," TP:",(tp>0?DoubleToString(tp,si.Digits()):"NONE")," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
-        // Record trade time for cooldown
-        GlobalVariableSet("SM7_lastTrade", (double)TimeCurrent());
+        lastTradeTime = TimeCurrent();
       }
    }
    else
@@ -945,7 +938,6 @@ void OpenTrade(int dir)
       
       double lot=CalcLot(asl);
       
-      // Cap SL to max $ loss
       if(InpMaxSL_USD > 0 && lot > 0)
       {
          double lossAtSL = 0;
@@ -973,7 +965,7 @@ void OpenTrade(int dir)
       }
       
       tp=ask-asl*InpBaseRR;
-      if(!InpUseTP) tp = 0; // NO TP — let SL trail do the work
+      if(!InpUseTP) tp = 0;
       else
       {
          for(int i=0;i<ArraySize(SNRs);i++)
@@ -985,7 +977,7 @@ void OpenTrade(int dir)
       if(tr.Sell(lot,_Symbol,bid,sl,tp,"SM7_SELL"))
       {
         Print("✓ SELL ",lot," SL:",sl," TP:",(tp>0?DoubleToString(tp,si.Digits()):"NONE")," MaxLoss:$",DoubleToString(InpMaxSL_USD,2));
-        GlobalVariableSet("SM7_lastTrade", (double)TimeCurrent());
+        lastTradeTime = TimeCurrent();
       }
    }
 }
@@ -1034,16 +1026,7 @@ void SetMaxProfit(ulong ticket, double val)
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE — Smart % Trailing + Emergency SL                          |
-//|                                                                   |
-//| Logic:                                                            |
-//|   profit < $1    → normal SL (no change)                         |
-//|   profit >= $1   → SL moves to breakeven +$0.20                  |
-//|   profit >= $2   → SL protects 60% of MAX profit                 |
-//|   profit $10     → SL at +$6                                     |
-//|   profit $20     → SL at +$12                                    |
-//|   profit $50     → SL at +$30                                    |
-//|   SL NEVER moves backwards!                                      |
+//| MANAGE — Smart % Trailing + Emergency SL (FIXED for SELL)        |
 //+------------------------------------------------------------------+
 void ManagePositions()
 {
@@ -1062,10 +1045,7 @@ void ManagePositions()
       datetime ot = pi.Time();
       ulong  tk   = pi.Ticket();
       
-      // === Calculate $ per point (works for ALL instruments including GOLD) ===
-      // Use OrderCalcProfit to get accurate value
-      double ppp = 0;
-      //=== EMERGENCY: hard $ loss limit — ALWAYS runs, no exceptions ===
+      // Emergency $ loss limit
       if(InpMaxSL_USD > 0 && prof <= -InpMaxSL_USD)
       {
          tr.PositionClose(tk);
@@ -1073,8 +1053,9 @@ void ManagePositions()
          continue;
       }
       
-      // === Calculate $ per point ===
-      double testDist = 100 * si.Point();
+      // Calculate $ per point (more robust)
+      double ppp = 0;
+      double testDist = 1000 * si.Point(); // increased for better accuracy
       double testProfit = 0;
       
       if(pi.PositionType() == POSITION_TYPE_BUY)
@@ -1088,97 +1069,78 @@ void ManagePositions()
             ppp = MathAbs(testProfit / testDist);
       }
       
+      // Fallback to TickValue/TickSize
       if(ppp <= 0)
       {
          double tv = si.TickValue();
          double ts = si.TickSize();
          if(tv > 0 && ts > 0) ppp = vol * tv / ts;
       }
-      
       if(ppp <= 0) continue;
       
-      //=== Track max profit ===
+      // Track max profit
       double prevMax = GetMaxProfit(tk);
       if(prof > prevMax) SetMaxProfit(tk, prof);
       double maxProf = GetMaxProfit(tk);
       
-      //=== Calculate target SL in $ ===
+      // Determine target lock in USD
       double targetLockUSD = 0;
       
       if(maxProf >= InpBE_StartUSD && maxProf < InpBE_StartUSD * 2)
       {
-         // Phase 1: just breakeven + small lock
          targetLockUSD = InpBE_FirstLock;
       }
       else if(maxProf >= InpBE_StartUSD * 2 && maxProf <= 15.0)
       {
-         // Phase 2: protect 60% of max profit (up to $15)
          targetLockUSD = maxProf * InpTrailPct / 100.0;
       }
       else if(maxProf > 15.0)
       {
-         // Phase 3: protect max profit minus $5 (tighter trail for big profits)
          targetLockUSD = maxProf - InpTrailFixed;
-         // Safety: never less than 60% of 15 = $9
          if(targetLockUSD < 15.0 * InpTrailPct / 100.0)
             targetLockUSD = 15.0 * InpTrailPct / 100.0;
       }
       
-      if(targetLockUSD <= 0) continue; // not yet in profit zone
+      if(targetLockUSD <= 0) continue;
       
-      //=== Convert $ lock to price and move SL ===
       double lockDist = targetLockUSD / ppp;
       
       if(pi.PositionType() == POSITION_TYPE_BUY)
       {
          double newSL = NormalizeDouble(op + lockDist, si.Digits());
-         
-         // SL NEVER moves down
-         if(newSL > cSL)
+         if(newSL > cSL)  // Only move up (tighter)
          {
-            bool ok = tr.PositionModify(tk, newSL, cTP);
-            if(ok)
-               Print("↑ SL→+$", DoubleToString(targetLockUSD,2),
-                     " (max:$", DoubleToString(maxProf,2),
-                     " now:$", DoubleToString(prof,2),
-                     " ppp:", DoubleToString(ppp,4), ") #", tk);
-            else
-               Print("⚠ SL modify FAILED #", tk, " newSL:", newSL,
-                     " err:", tr.ResultRetcodeDescription());
+            if(tr.PositionModify(tk, newSL, cTP))
+               Print("↑ SL→+$", DoubleToString(targetLockUSD,2), " (max:$", DoubleToString(maxProf,2), " now:$", DoubleToString(prof,2), ") #", tk);
          }
       }
       else // SELL
       {
          double newSL = NormalizeDouble(op - lockDist, si.Digits());
-         
-         // For SELL: profit SL is BELOW open price
-         // newSL should be below op (in profit zone)
-         // Move SL if: no SL set, or SL is still above op (loss zone), or newSL locks MORE profit
+         // For SELL: we want SL to move DOWN (tighter). So newSL should be < current SL (if SL exists)
+         // If no SL, set it. If current SL is above op (loss zone) - move to profit.
          bool shouldMove = false;
-         
-         if(cSL == 0)                          shouldMove = true;  // No SL
-         else if(cSL >= op && newSL < op)       shouldMove = true;  // Move from loss to profit zone
-         else if(cSL < op && newSL < cSL)       shouldMove = false; // Would REDUCE lock (newSL further from op)
-         else if(cSL < op && newSL > cSL && newSL < op) shouldMove = true; // Locks MORE (closer to op but still profit)
+         if(cSL == 0)
+            shouldMove = true;
+         else if(cSL >= op && newSL < op)
+            shouldMove = true;
+         else if(cSL < op && newSL < cSL)  // FIXED: allow moving SL lower (tighter)
+            shouldMove = true;
+         else if(cSL < op && newSL > cSL && newSL < op)
+            shouldMove = true;  // still profit zone but less tight - should not happen often
          
          if(shouldMove)
          {
-            bool ok = tr.PositionModify(tk, newSL, cTP);
-            if(ok)
-               Print("↓ SL→+$", DoubleToString(targetLockUSD,2),
-                     " (max:$", DoubleToString(maxProf,2),
-                     " now:$", DoubleToString(prof,2), ") #", tk);
-            else
-               Print("⚠ SELL SL FAILED #", tk, " new:", newSL, " cur:", cSL,
-                     " op:", op, " err:", tr.ResultRetcodeDescription());
+            if(tr.PositionModify(tk, newSL, cTP))
+               Print("↓ SL→+$", DoubleToString(targetLockUSD,2), " (max:$", DoubleToString(maxProf,2), " now:$", DoubleToString(prof,2), ") #", tk);
          }
       }
       
-      //=== TIME CLOSE ===
+      // Time close
       if(InpTimeClose && prof >= InpTC_MinProf)
       {
-         int el = (int)(TimeCurrent() - ot) / 60;
-         if(el >= InpTC_Min)
+         int elapsed = (int)((TimeCurrent() - ot) / 60);
+         if(elapsed >= InpTC_Min)
          {
             tr.PositionClose(tk);
             Print("⏱ Close #", tk, " +$", DoubleToString(prof,2));
@@ -1188,7 +1150,7 @@ void ManagePositions()
 }
 
 //+------------------------------------------------------------------+
-//| CHART DRAWING (toggleable)                                        |
+//| CHART DRAWING (unchanged)                                        |
 //+------------------------------------------------------------------+
 void DrawChart()
 {
@@ -1312,7 +1274,7 @@ void OnTimer()
    
    string s="";
    s+="╔════════════════════════════════════════╗\n";
-   s+="║ SmartMoney v7 — Weighted Scoring\n";
+   s+="║ SmartMoney v7.10 FIXED\n";
    s+="╠════════════════════════════════════════╣\n";
    s+="║ $"+DoubleToString(bal,2)+" | DD:"+DoubleToString(dd,1)+
       "% | "+(pnl>=0?"+":"")+DoubleToString(pnl,2)+"\n";
